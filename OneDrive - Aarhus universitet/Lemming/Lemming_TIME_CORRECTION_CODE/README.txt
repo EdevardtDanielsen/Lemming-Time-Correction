@@ -1,5 +1,3 @@
-# Note for myself: D2 doesnt have may. maybe time_drift
-
 RTC-TTN TIME ALIGNMENT PIPELINE
 ================================
 
