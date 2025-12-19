@@ -1,0 +1,430 @@
+================================================================================
+TIME ALIGNMENT DOCUMENTATION
+Understanding _adaptive_alignment and _interpolate_alignment
+================================================================================
+
+Document Created: December 16, 2025
+Author: Edevardt Johan Danielsen (with Claude assistance)
+Related Files: time_alignment.py, main_pipeline.py
+
+================================================================================
+PART 1: THE BUG THAT WAS FIXED (December 2025)
+================================================================================
+
+SYMPTOM OBSERVED
+----------------
+When examining corrected timestamps for Fex CO2/CH4 sensor data, there was a
+consistent ~17 minute discrepancy between the expected time and the corrected
+time. For example:
+
+    Original_RTC:        16.05.2025 14:31:42  (device clock)
+    Corrected_Local_Time: 2025-05-16 15:14:39  (pipeline output)
+
+The minutes showed :31 in the original but :14 in the corrected output. The
+RTC time appeared closer to reality than the "corrected" time, which defeated
+the purpose of the correction pipeline.
+
+
+ROOT CAUSE
+----------
+The bug was in the decision logic of _adaptive_alignment(). The function was
+designed to choose the best alignment strategy based on data characteristics,
+but it made a poor choice for long segments with many TTN anchors.
+
+OLD (BUGGY) LOGIC:
+    if good_matches >= 2:
+        # Have good anchors at both ends - use linear drift model
+        return self._linear_drift_alignment(rtc_times, unix_times)
+
+The problem: When endpoints had "good" matches, it used _linear_drift_alignment
+which only uses TWO anchor points (first and last) to calculate a single drift
+rate. This rate was then applied linearly across the entire segment, which
+could span weeks or months of data.
+
+WHY THIS CAUSED ~17 MINUTE ERRORS:
+
+1. The segment might span 2+ months of continuous measurements
+2. The linear model calculates: drift_rate = (ttn_duration - rtc_duration) / rtc_duration
+3. This single rate is applied proportionally to all timestamps in between
+4. But RTC drift is NOT perfectly linear over long periods
+5. Small errors at endpoints get amplified in the middle of the segment
+6. Result: timestamps in the middle of long segments were significantly wrong
+
+
+THE FIX
+-------
+The fix changes the decision priority in _adaptive_alignment():
+
+NEW LOGIC:
+    1. Count how many TTN anchors exist within the segment's time range
+    2. If >= 3 anchors exist -> use _interpolate_alignment (piecewise-linear)
+    3. If < 3 anchors but good endpoints -> use _linear_drift_alignment
+    4. If only one good anchor -> use _anchor_alignment
+    5. Otherwise -> interpolate from nearest available anchors
+
+The key insight is that _interpolate_alignment uses np.interp() which performs
+PIECEWISE-LINEAR interpolation between ALL TTN anchors, not just endpoints.
+With hourly TTN data, this means drift is recalculated at every hour boundary.
+
+
+WHY INTERPOLATION IS BETTER FOR LONG SEGMENTS:
+
+Consider a segment spanning 30 days with hourly TTN anchors (720 anchors):
+
+OLD METHOD (linear drift):
+    - Uses only 2 points: hour 0 and hour 720
+    - Calculates one drift rate
+    - Applies it uniformly
+    - Error at hour 360 could be significant
+
+NEW METHOD (piecewise interpolation):
+    - Uses all 720 anchor points
+    - Drift is recalculated at each hour boundary
+    - Error at any point is bounded by the nearest anchor (~1 hour away)
+    - Much more accurate for non-linear drift patterns
+
+
+================================================================================
+PART 2: OVERVIEW - THE TIMESTAMP MISALIGNMENT PROBLEM
+================================================================================
+
+Environmental sensors deployed in the field (like the Lemming GHG sensors)
+record measurements with timestamps from their internal Real-Time Clock (RTC).
+These RTC chips have inherent limitations:
+
+1. CRYSTAL DRIFT: RTC crystals drift at rates of ~20 ppm (parts per million),
+   which translates to roughly 1.7 seconds per day or nearly a minute per month.
+
+2. FIXED TIMEZONE: The Arduino RTC is set using the __TIME__ macro at compile
+   time, capturing the LOCAL time of the compilation computer. This creates a
+   fixed UTC offset (e.g., UTC+1 for Copenhagen winter) with NO DST awareness.
+
+3. NO NETWORK SYNC: Unlike phones or computers, field sensors cannot sync
+   their clocks via NTP or GPS during normal operation.
+
+4. POWER EVENTS: Battery changes, solar panel failures, or device resets can
+   cause sudden time jumps or resets to default times.
+
+The solution is to use network timestamps (TTN received_at) as ground truth.
+When the sensor transmits data via LoRaWAN, The Things Network records the
+exact UTC time of reception. By comparing the device's reported time (unix
+field in payload) with TTN's received_at, we can measure and correct drift.
+
+However, a single global correction is insufficient because:
+
+- Drift rate may vary over time (temperature affects crystal frequency)
+- Device resets create sudden time jumps
+- Gaps in TTN coverage mean we can't always measure drift
+- Different deployment periods may have different drift characteristics
+
+This is why we need ADAPTIVE and INTERPOLATED approaches that handle the
+complexity of real-world sensor deployments.
+
+
+================================================================================
+PART 3: CONCEPT OF SEGMENTATION
+================================================================================
+
+WHAT IS SEGMENTATION?
+---------------------
+Segmentation divides the continuous time series of sensor measurements into
+discrete chunks that can be processed independently. Each segment represents
+a period of "normal" operation without major discontinuities.
+
+
+WHAT TRIGGERS A NEW SEGMENT?
+----------------------------
+The DataSegmenter class (in data_loading.py) creates segment boundaries when:
+
+1. LARGE TIME GAPS: If the gap between consecutive measurements exceeds
+   MAX_INTRA_SEGMENT_GAP (configurable, typically 1-4 hours), a new segment
+   starts. This catches power outages, device resets, or data gaps.
+
+2. TIME REVERSALS: If a timestamp is EARLIER than the previous one, this
+   indicates a device reset or clock jump. New segment starts immediately.
+
+3. FILE BOUNDARIES: Optionally, segment at file boundaries to handle cases
+   where different files represent different deployment periods.
+
+4. ANCHOR BREAKS: If there's a long gap in TTN coverage (no anchors), the
+   segment may be split to avoid extrapolating drift too far.
+
+
+WHY IS SEGMENTATION NECESSARY?
+------------------------------
+Without segmentation, the alignment algorithm would try to fit a single model
+across discontinuities, leading to:
+
+1. AVERAGING ERRORS: A single drift model across a device reset would average
+   the pre-reset and post-reset behavior, being wrong for both periods.
+
+2. IMPOSSIBLE INTERPOLATION: If the device clock jumped forward by 3 months
+   due to a reset, interpolating between the jump would place measurements
+   at completely wrong times.
+
+3. ANCHOR MISMATCHES: The algorithm might match RTC times to wrong TTN anchors
+   if it doesn't recognize that a discontinuity occurred.
+
+Example of what goes wrong without segmentation:
+
+    Day 1-30:  RTC drifts +2 seconds/day (RTC is 60 seconds ahead by day 30)
+    Day 30:    Device reset, RTC jumps back to January 1, 2020
+    Day 31-60: RTC drifts normally from the reset time
+
+    Without segmentation: Algorithm sees RTC going from "Feb 1" to "Jan 1, 2020"
+    to "Feb 1, 2020". It might try to interpolate across this, creating chaos.
+
+    With segmentation: Day 30 gap triggers new segment. Each segment is
+    aligned independently using anchors appropriate to that period.
+
+
+================================================================================
+PART 4: _adaptive_alignment FUNCTION
+================================================================================
+
+CONCEPTUAL PURPOSE
+------------------
+The _adaptive_alignment function is the "decision maker" that selects the most
+appropriate alignment strategy for a given segment based on the available data.
+It analyzes the segment's characteristics and TTN anchor availability, then
+delegates to the appropriate specialized alignment method.
+
+
+HOW IT USES ANCHOR POINTS
+-------------------------
+The function examines TTN anchor points in two ways:
+
+1. ANCHOR DENSITY: Counts how many TTN anchors fall within the segment's time
+   range (with 1-hour padding). This determines whether piecewise interpolation
+   is viable.
+
+2. ENDPOINT QUALITY: Checks if there are good matches for the first and last
+   timestamps of the segment. "Good" means the nearest TTN anchor is within
+   acceptable distance (typically within 1 hour).
+
+
+HOW DRIFT IS ESTIMATED
+----------------------
+The function itself doesn't estimate drift - it delegates to specialized methods:
+
+- _interpolate_alignment: Calculates drift at each TTN anchor, interpolates
+- _linear_drift_alignment: Calculates single drift rate from endpoints
+- _anchor_alignment: Uses one anchor's drift for entire segment
+
+
+ADAPTATION ACROSS SEGMENTS
+--------------------------
+Each segment is processed independently, so _adaptive_alignment runs separately
+for each. This means:
+
+- A segment with dense TTN coverage gets piecewise interpolation
+- A segment with sparse coverage might get linear drift
+- A segment with no nearby anchors gets extrapolation from distant anchors
+
+The adaptation happens automatically based on what data is available.
+
+
+WHEN IS THIS METHOD PREFERRED?
+------------------------------
+_adaptive_alignment is the DEFAULT entry point for segment alignment. It should
+be used in most cases because it automatically selects the best sub-method.
+
+STRENGTHS:
+- Handles varying data quality automatically
+- No manual tuning required for different segments
+- Gracefully degrades when anchor data is sparse
+
+LIMITATIONS:
+- Relies on accurate anchor density counting
+- The ">= 3 anchors" threshold is somewhat arbitrary
+- Cannot recover from systematic errors in TTN data
+
+
+================================================================================
+PART 5: _interpolate_alignment FUNCTION
+================================================================================
+
+CONCEPTUAL PURPOSE
+------------------
+The _interpolate_alignment function performs PIECEWISE-LINEAR interpolation
+of clock drift using ALL available TTN anchors. It treats each TTN anchor as
+a known "truth point" where we can calculate exact drift, then interpolates
+drift values for all measurement timestamps between anchors.
+
+
+HOW INTERPOLATION WORKS
+-----------------------
+The algorithm proceeds as follows:
+
+1. COLLECT ALL ANCHORS: Get all TTN unix times and their corresponding
+   received_at timestamps.
+
+2. CALCULATE DRIFT AT EACH ANCHOR:
+   drift = received_at_seconds - unix_seconds
+
+   For example:
+   - TTN unix (device clock): 1718451045 (2024-06-15 12:30:45 in device time)
+   - TTN received_at (truth): 1718451047 (2024-06-15 12:30:47 UTC)
+   - Drift at this anchor: +2 seconds (device was 2 seconds behind)
+
+3. BUILD DRIFT TABLE: Creates arrays of (unix_time, drift) pairs for all anchors
+
+4. INTERPOLATE: Uses numpy.interp() to find the drift value for each
+   measurement timestamp:
+
+   interpolated_drift = np.interp(measurement_unix, anchor_unix, anchor_drift)
+
+   This performs LINEAR interpolation between consecutive anchors.
+
+5. APPLY CORRECTION:
+   corrected_time = measurement_unix + interpolated_drift
+
+
+GENERATING CORRECTED TIMESTAMPS
+-------------------------------
+For each measurement with RTC timestamp T_rtc:
+
+1. Convert T_rtc to unix seconds
+2. Look up interpolated drift from the anchor table
+3. Add drift to get corrected unix time
+4. Convert back to datetime with UTC timezone
+
+The confidence score is based on distance to nearest anchor:
+- < 60 seconds from anchor: 0.9 (high confidence)
+- < 1 hour from anchor: 0.7 (good confidence)
+- < 1 day from anchor: 0.5 (moderate confidence)
+- > 1 day from anchor: 0.3 (low confidence, extrapolating)
+
+
+WHEN IS INTERPOLATION USED?
+---------------------------
+Interpolation is used when:
+1. There are >= 3 TTN anchors within the segment's time range (preferred)
+2. There are no good endpoint matches, so linear/anchor methods can't work
+3. Explicitly requested via strategy='interpolate' parameter
+
+
+ASSUMPTIONS AND RISKS
+---------------------
+ASSUMPTIONS:
+- Drift changes linearly between consecutive anchors
+- TTN received_at times are accurate (they are - NTP synced servers)
+- The unix field in TTN payload matches the RTC time on SD card
+
+RISKS:
+1. SPARSE ANCHORS: If anchors are days apart, the linear interpolation between
+   them may not capture non-linear drift (e.g., from temperature changes).
+
+2. ANCHOR GAPS: If there's a gap in TTN coverage (device out of LoRa range),
+   the segment might span a long anchor-free period.
+
+3. EXTRAPOLATION: For measurements outside the anchor range, np.interp()
+   uses the nearest anchor's drift value (flat extrapolation). This can be
+   wrong if drift was changing.
+
+4. ANCHOR ERRORS: If a TTN anchor has an error (e.g., packet delay), that
+   error propagates to nearby interpolated timestamps.
+
+
+================================================================================
+PART 6: RELATIONSHIP BETWEEN THE TWO METHODS
+================================================================================
+
+HOW THEY COMPLEMENT EACH OTHER
+------------------------------
+_adaptive_alignment and _interpolate_alignment are not alternatives - they
+work together in a hierarchy:
+
+    _adaptive_alignment (decision maker)
+         |
+         +---> _interpolate_alignment (when many anchors available)
+         |
+         +---> _linear_drift_alignment (when few anchors, good endpoints)
+         |
+         +---> _anchor_alignment (when only one good anchor)
+
+_adaptive_alignment CALLS _interpolate_alignment when appropriate. The two
+functions have different responsibilities:
+
+- _adaptive_alignment: DECIDES which method to use based on data quality
+- _interpolate_alignment: EXECUTES piecewise-linear drift correction
+
+
+TYPICAL EXECUTION ORDER
+-----------------------
+In the main pipeline (main_pipeline.py), the flow is:
+
+1. Load SD card data and TTN reference data
+2. Segment the data based on time gaps
+3. For each segment:
+   a. Call align_segment() which invokes _adaptive_alignment()
+   b. _adaptive_alignment() counts anchors and checks endpoint quality
+   c. Based on analysis, calls the appropriate sub-method
+   d. Returns aligned timestamps with confidence scores
+4. Combine all aligned segments
+5. Post-process (backward propagation, group corrections, etc.)
+6. Validate against TTN ground truth
+7. Write output files
+
+
+WHY BOTH ARE NEEDED
+-------------------
+Real-world sensor deployments have VARYING data quality across time:
+
+SCENARIO 1: Device near LoRa gateway
+- TTN coverage: Excellent (hourly anchors)
+- Best method: _interpolate_alignment with piecewise correction
+- Error expected: < 5 seconds
+
+SCENARIO 2: Device moved to remote location
+- TTN coverage: Sparse (daily or less)
+- Best method: _linear_drift_alignment between available anchors
+- Error expected: < 1 minute
+
+SCENARIO 3: Device just deployed, one uplink received
+- TTN coverage: Single anchor
+- Best method: _anchor_alignment using that one point
+- Error expected: Proportional to time from anchor
+
+SCENARIO 4: Device out of LoRa range entirely
+- TTN coverage: None in segment range
+- Best method: _interpolate_alignment (extrapolates from nearest)
+- Error expected: Larger, but better than nothing
+
+Having multiple methods allows the pipeline to handle all these scenarios
+automatically, providing the best possible correction given the available data.
+
+
+================================================================================
+PART 7: SUMMARY OF CHANGES MADE (DECEMBER 2025)
+================================================================================
+
+FILE MODIFIED: time_alignment.py
+
+FUNCTION CHANGED: _adaptive_alignment()
+
+OLD BEHAVIOR:
+- Checked if segment endpoints had good TTN matches
+- If yes, used _linear_drift_alignment (only 2 anchor points)
+- Only used _interpolate_alignment as fallback when endpoints were bad
+
+NEW BEHAVIOR:
+- First counts TTN anchors within segment's time range
+- If >= 3 anchors available, uses _interpolate_alignment (piecewise)
+- Falls back to linear/anchor methods only when few anchors exist
+
+IMPACT:
+- For segments with hourly TTN coverage, now uses all anchors
+- Drift correction is more accurate for long segments
+- The ~17 minute error seen in May 2025 data should be eliminated
+- Validation MAE should improve significantly
+
+RECOMMENDATION:
+After making this change, re-run the pipeline on affected data and check:
+1. Direct validation MAE (should be ~2-5 seconds with good coverage)
+2. Cross-validation MAE (should match direct validation)
+3. Spot-check some timestamps manually against known events
+
+================================================================================
+END OF DOCUMENT
+================================================================================

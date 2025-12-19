@@ -1,0 +1,93 @@
+================================================================================
+TIME EXPLANATION FOR LEMMING GHG SENSORS
+================================================================================
+
+
+1. WHAT IS UNIX TIME?
+---------------------
+Unix time = seconds since January 1, 1970 00:00:00 UTC
+Example: 1718451045 = 2024-06-15 12:30:45 UTC
+Unix time is ALWAYS in UTC (no timezone information stored)
+
+
+================================================================================
+THE THREE TIME SOURCES
+================================================================================
+
+2. DEVICE RTC TIME (SD card timestamps)
+---------------------------------------
+Source:     DS1307 RTC chip on the device
+Format:     DD.MM.YYYY HH:MM:SS (e.g., 25.03.2025 10:00:00)
+Timezone:   FIXED UTC offset set at compile time
+
+How it's set:
+- Arduino uses __TIME__ macro at compile time
+- Captures the LOCAL time of the computer that compiled the firmware
+- NO DST awareness - offset is permanent:
+    * Compiled in Copenhagen winter --> permanently UTC+1
+    * Compiled in Copenhagen summer --> permanently UTC+2
+
+This time is written to SD card files.
+
+
+3. TTN unix (device payload field)
+----------------------------------
+Source:     rtc.now().unixtime() in firmware
+Format:     Unix timestamp (e.g., 1718451045)
+Timezone:   UTC (unixtime() converts RTC to UTC)
+
+Firmware code proof:
+    DateTime timeNow = rtc.now();
+    unsigned long unix = timeNow.unixtime();  // <-- Sent to TTN
+    data[8-11] = unix bytes;
+    lora.transferPacket(data, 12);
+
+This reflects the device's RTC converted to Unix time.
+
+
+4. TTN received_at (server timestamp)
+-------------------------------------
+Source:     The Things Network server clock
+Format:     ISO8601 with timezone (e.g., 2025-03-25T10:00:00.000Z)
+Timezone:   UTC
+Accuracy:   Very accurate (synced to internet time servers)
+
+This is GROUND TRUTH - the exact moment TTN received the message.
+
+
+================================================================================
+HOW TIME CORRECTION WORKS
+================================================================================
+
+5. DRIFT CALCULATION
+--------------------
+When device sends a LoRa message, we compare:
+
+    unix (device RTC):      1718451045  --> 2024-06-15 12:30:45 UTC
+    received_at (TTN):      1718451047  --> 2024-06-15 12:30:47 UTC
+    --------------------------------------------------------
+    Drift:                  +2 seconds  (device was 2 sec behind)
+
+If drift is small and consistent --> SD card timestamps are reliable
+If drift is large or varying --> timestamps need correction
+
+
+6. SUMMARY TABLE
+----------------
++------------------+------------------+----------+---------------------------+
+| Time Source      | Timezone         | Accurate | Used For                  |
++------------------+------------------+----------+---------------------------+
+| SD card (RTC)    | UTC+1 or +2 fixed| Drifts   | Raw measurements          |
+| unix (payload)   | UTC              | Drifts   | Matching SD to TTN        |
+| received_at      | UTC              | YES      | Ground truth reference    |
++------------------+------------------+----------+---------------------------+
+
+
+7. WHY THIS MATTERS
+-------------------
+- SD card timestamps may drift over time (RTC crystal is imperfect)
+- By comparing unix vs received_at, we measure and correct this drift
+- All corrected output times are converted to UTC for consistency
+
+
+================================================================================

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.env/
+.venv/
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Output directories (don't commit processed data)
+RAW_DATA_TIME_CORRECTED/
+TIME_CORRECTION_LOGBOOK/
+
+# Intermediate files
+*.parquet
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
